@@ -39,7 +39,7 @@ def auto_arima(y, exogenous=None, start_p=2, d=None, start_q=2, max_p=5, max_d=2
                seasonal=True, stationary=False, information_criterion='aic', alpha=0.05, test='kpss',
                seasonal_test='ch', n_jobs=1, start_params=None, trend='c', method=None, transparams=True,
                solver='lbfgs', maxiter=50, disp=0, callback=None, offset_test_args=None, seasonal_test_args=None,
-               suppress_warnings=False, error_action='warn', trace=False, **fit_args):
+               suppress_warnings=False, error_action='warn', trace=False, stepwise=True, **fit_args):
     """The ``AutoARIMA`` function seeks to identify the most optimal parameters for an ``ARIMA`` model,
     and returns a fitted ARIMA model. This function is based on the commonly-used R function,
     `forecase::auto.arima``[3].
@@ -214,7 +214,7 @@ def auto_arima(y, exogenous=None, start_p=2, d=None, start_q=2, max_p=5, max_d=2
     if any(_ < 0 for _ in (max_p, max_q, max_P, max_Q, start_p, start_q, start_P, start_Q)):
         raise ValueError('starting and max p, q, P & Q values must be positive integers (>= 0)')
     if max_p <= start_p or max_q <= start_q or max_P <= start_P or max_Q <= start_Q:
-        raise ValueError('max p, q, P & Q must be less than their starting values')
+        raise ValueError('max p, q, P & Q must be greater than their starting values')
 
     # validate max_order
     if max_order is None:
@@ -269,6 +269,17 @@ def auto_arima(y, exogenous=None, start_p=2, d=None, start_q=2, max_p=5, max_d=2
     # max.q <- min(max.q, floor(serieslength/3))
     max_p = int(min(max_p, np.floor(n_samples / 3)))
     max_q = int(min(max_q, np.floor(n_samples / 3)))
+
+    # if max_p or max_q was set to zero, make it one. Also make sure that
+    # max_p and max_q are at least 1 greater than start_p, start_q
+    # this is not in the R code, but was added by me.
+    if max_p == 0:
+        max_p = 1
+        start_p = 0
+
+    if max_q == 0:
+        max_q = 1
+        start_q = 0
 
     # if it's not seasonal, we can avoid multiple 'if not is None' comparisons
     # later by just using this shortcut (hack):
@@ -358,55 +369,119 @@ def auto_arima(y, exogenous=None, start_p=2, d=None, start_q=2, max_p=5, max_d=2
             max_q = min(max_q, m - 1)
         pass
 
-    # generate the set of (p, q, P, Q) FIRST, since it is contingent on whether or not
-    # the user is interested in a seasonal ARIMA result. This will reduce the search space
-    # for non-seasonal ARIMA models.
-    def generator():
-        # loop p, q. Make sure to loop at +1 interval,
-        # since max_{p|q} is inclusive.
-        if seasonal:
+    # if we are not fitting stepwise, do it in parallel (this can be slow...):
+    if not stepwise:
+        # generate the set of (p, q, P, Q) FIRST, since it is contingent on whether or not
+        # the user is interested in a seasonal ARIMA result. This will reduce the search space
+        # for non-seasonal ARIMA models.
+        def generator():
+            # loop p, q. Make sure to loop at +1 interval,
+            # since max_{p|q} is inclusive.
+            if seasonal:
+                return (
+                    ((p, d, q), (P, D, Q, m))
+                    for p in xrange(start_p, max_p + 1)
+                    for q in xrange(start_q, max_q + 1)
+                    for P in xrange(start_P, max_P + 1)
+                    for Q in xrange(start_Q, max_Q + 1)
+                    if p + q + P + Q <= max_order
+                )
+
+            # otherwise it's not seasonal, and we don't need the seasonal pieces
             return (
-                ((p, d, q), (P, D, Q, m))
+                ((p, d, q), None)
                 for p in xrange(start_p, max_p + 1)
                 for q in xrange(start_q, max_q + 1)
-                for P in xrange(start_P, max_P + 1)
-                for Q in xrange(start_Q, max_Q + 1)
-                if p + q + P + Q <= max_order
+                if p + q <= max_order
             )
 
-        # otherwise it's not seasonal, and we don't need the seasonal pieces
-        return (
-            ((p, d, q), None)
-            for p in xrange(start_p, max_p + 1)
-            for q in xrange(start_q, max_q + 1)
-            if p + q <= max_order
-        )
+        # get results in parallel
+        gen = generator()  # the combos we need to fit
+        all_res = Parallel(n_jobs=n_jobs)(
+            delayed(_fit_arima)(y, xreg=exogenous, order=order, seasonal_order=seasonal_order,
+                                start_params=start_params, trend=trend, method=method, transparams=transparams,
+                                solver=solver, maxiter=maxiter, disp=disp, callback=callback,
+                                fit_params=fit_args, suppress_warnings=suppress_warnings,
+                                trace=trace, error_action=error_action)
+            for order, seasonal_order in gen)
 
-    # get results in parallel
-    gen = generator()  # the combos we need to fit
-    all_res = Parallel(n_jobs=n_jobs)(
-        delayed(_fit_arima)(y, xreg=exogenous, order=order, seasonal_order=seasonal_order,
-                            start_params=start_params, trend=trend, method=method, transparams=transparams,
-                            solver=solver, maxiter=maxiter, disp=disp, callback=callback,
-                            fit_params=fit_args, suppress_warnings=suppress_warnings,
-                            trace=trace, error_action=error_action)
-        for order, seasonal_order in gen)
+        # filter the non-successful ones
+        filtered = [m for m in all_res if m is not None]
+        if not filtered:
+            raise ValueError('No ARIMAs were successfully fit. It is likely your data is non-stationary. '
+                             'Please induce stationarity or try a different range of model order params.')
 
-    # filter the non-successful ones
-    filtered = [m for m in all_res if m is not None]
-    if not filtered:
-        raise ValueError('No ARIMAs were successfully fit. It is likely your data is non-stationary. '
-                         'Please induce stationarity or try a different range of model order params.')
+        # sort by the criteria, lower is better
+        sorted_res = sorted(filtered, key=(lambda model: getattr(model, information_criterion)()))
+        best = sorted_res[0]
 
-    # sort by the criteria
-    sorted_res = sorted(filtered, key=(lambda model: getattr(model, information_criterion)()), reverse=True)
-    best = sorted_res[0]
+        # remove all the cached .pmdpkl files...
+        for model in sorted_res:
+            model._clear_cached_state()
 
-    # remove all the cached .pmdpkl files...
-    for model in sorted_res:
-        model._clear_cached_state()
+        return best
 
-    return best
+    # otherwise use the stepwise algorithm to search for the best...
+    if n_samples < 10:
+        start_p = min(start_p, 1L)
+        start_q = min(start_q, 1L)
+        start_P = 0L
+        start_Q = 0L
+
+    p = start_p = min(start_p, max_p)
+    q = start_q = min(start_q, max_q)
+    P = start_P = min(start_P, max_P)
+    Q = start_Q = min(start_Q, max_Q)
+
+    # why do they do this?
+    best_ic = np.inf  # lower is better
+    best_model = None
+
+    # this is a wrapper function that ships off a call to fit an arima and
+    # reduces the boilerplate code required otherwise
+    def _do_fit_return_best(o, s):
+        modl = _fit_arima(y, xreg=exogenous, order=o, seasonal_order=s,
+                          start_params=start_params, trend=trend, method=method,
+                          transparams=transparams, solver=solver, maxiter=maxiter,
+                          disp=disp, callback=callback, fit_params=fit_args,
+                          suppress_warnings=suppress_warnings, trace=trace,
+                          error_action=error_action)
+
+        # if it DID work, update the current best
+        if modl is not None:
+            ic = getattr(modl, information_criterion)()
+            if ic < best_ic:
+                return modl, ic, True
+
+        # if we get here, either the model didn't work (is None), or the IC
+        # is not as good as the last one, so just keep the last one.
+        return best_model, best_ic, False
+
+    # do initial fit
+    best_model, best_ic, _ = _do_fit_return_best(o=(p, d, q), s=(P, D, Q, m))
+
+    # try a null model
+    best_model, best_ic, did_change = _do_fit_return_best(o=(0, d, 0), s=(0, D, 0, m))
+    if did_change:
+        p = q = P = Q = 0
+
+    # try a basic AR model
+    # if max_p > 0 or max_P > 0:  # they have to be--we enforce it, don't we?
+    best_model, best_ic, did_change = _do_fit_return_best(o=(1, d, 0), s=(int(m > 1), D, 0, m))
+    if did_change:
+        p = 1  # p <- (max.p>0)
+        P = int(m > 1)  # P <- (m>1) & (max.P>0)
+        q = Q = 0
+
+    # try a basic MA model
+    # if max_q > 0 or max_Q > 0:  # they have to be--we enforce it, don't we?
+    best_model, best_ic, did_change = _do_fit_return_best(o=(0, d, 1), s=(0, D, int(m > 1), m))
+    if did_change:
+        p = P = 0
+        Q = int(m > 1)  # (m>1) & (max.Q>0)
+        q = 1  # (max.q>0)
+
+
 
 
 def _fit_arima(x, xreg, order, seasonal_order, start_params, trend, method, transparams,

@@ -137,7 +137,8 @@ def test_the_r_src():
 
     # > fit = forecast::auto.arima(abc, max.p=5, max.d=5, max.q=5, max.order=100)
     fit = auto_arima(abc, max_p=5, max_d=5, max_q=5, max_order=100, seasonal=False,
-                     trend='c', suppress_warnings=True, error_action='ignore')
+                     trend='c', suppress_warnings=True, error_action='ignore',
+                     stepwise=False)
 
     # this differs from the R fit, but has a higher AIC, so the objective was achieved...
     assert abs(140 - fit.aic()) < 1.0
@@ -181,7 +182,8 @@ def test_many_orders():
 
     failed = False
     try:
-        auto_arima(lynx_bc, start_p=1, start_q=1, d=0, max_p=5, max_q=5, n_jobs=-1)
+        auto_arima(lynx_bc, start_p=1, start_q=1, d=0, max_p=5,
+                   max_q=5, n_jobs=-1, stepwise=False)
     except ValueError:
         failed = True
     assert failed
@@ -199,8 +201,8 @@ def test_with_seasonality():
 
     # can we auto-arima this?
     seasonal_fit = auto_arima(wineind, start_p=1, start_q=1, max_p=2, max_q=2, m=12,
-                              start_P=0, seasonal=True, n_jobs=-1, d=1, D=1,
-                              error_action='raise')  # do raise so it fails fast
+                              start_P=0, seasonal=True, n_jobs=1, d=1, D=1,
+                              error_action='raise', stepwise=True)  # do raise so it fails fast
 
     # show that we can forecast even after the pickling (this was fit in parallel)
     seasonal_fit.predict(n_periods=10)
@@ -212,7 +214,7 @@ def test_with_seasonality():
     auto_arima(wineind, start_p=1, start_q=1, max_p=2, max_q=2, m=12,
                start_P=0, seasonal=True, n_jobs=1, d=1, D=None,
                error_action='ignore', suppress_warnings=True,
-               trace=True)  # get the coverage on trace
+               trace=True, stepwise=True)  # get the coverage on trace
 
 
 def test_corner_cases():
@@ -223,11 +225,12 @@ def test_corner_cases():
         warnings.simplefilter('ignore')
 
         # show a constant result will result in a quick fit
-        _ = auto_arima(np.ones(10), suppress_warnings=True)
+        _ = auto_arima(np.ones(10), suppress_warnings=True, stepwise=False)
 
         # show that with <= 3 samples, using a non-aic metric reverts to AIC
         try:
-            _ = auto_arima(np.arange(3), information_criterion='bic', seasonal=False, suppress_warnings=True)
+            _ = auto_arima(np.arange(3), information_criterion='bic', seasonal=False,
+                           suppress_warnings=True, stepwise=False, n_jobs=-1)
         except ValueError:  # this happens because it can't fit such small data...
             pass
 
